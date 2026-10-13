@@ -171,8 +171,9 @@ def clean_cnpj(val):
     return s if len(s) == 14 else None
 
 def fetch_cnpj(cnpj):
+    # Tenta BrasilAPI
     try:
-        r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=12)
+        r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=15)
         if r.status_code == 200:
             d = r.json()
             return {
@@ -183,9 +184,47 @@ def fetch_cnpj(cnpj):
                 "municipio": d.get("municipio", ""),
                 "uf": d.get("uf", ""),
                 "abertura": d.get("data_inicio_atividade", ""),
+                "fonte": "BrasilAPI"
             }
     except Exception:
         pass
+
+    # Fallback OpenCNPJ
+    try:
+        r = requests.get(f"https://api.opencnpj.org/{cnpj}", timeout=15)
+        if r.status_code == 200:
+            d = r.json()
+            return {
+                "razao_social": d.get("razao_social") or d.get("razaoSocial") or "",
+                "nome_fantasia": d.get("nome_fantasia") or d.get("nomeFantasia") or "",
+                "situacao": d.get("situacao_cadastral") or d.get("situacaoCadastral") or "",
+                "cnae": d.get("cnae_principal") or d.get("cnaePrincipal") or "",
+                "municipio": d.get("municipio") or "",
+                "uf": d.get("uf") or "",
+                "abertura": d.get("data_inicio_atividade") or d.get("dataInicioAtividades") or "",
+                "fonte": "OpenCNPJ"
+            }
+    except Exception:
+        pass
+
+    # Fallback CNPJá Open
+    try:
+        r = requests.get(f"https://open.cnpja.com/office/{cnpj}", timeout=15)
+        if r.status_code == 200:
+            d = r.json()
+            return {
+                "razao_social": d.get("companyName") or "",
+                "nome_fantasia": d.get("alias") or "",
+                "situacao": (d.get("status") or {}).get("text") or "",
+                "cnae": (d.get("mainActivity") or {}).get("text") or "",
+                "municipio": ((d.get("headquarters") or {}).get("address") or {}).get("city") or "",
+                "uf": ((d.get("headquarters") or {}).get("address") or {}).get("state") or "",
+                "abertura": d.get("foundedDate") or "",
+                "fonte": "CNPJá"
+            }
+    except Exception:
+        pass
+
     return None
 
 def search_mongo(nome, razao):
@@ -469,6 +508,7 @@ def process():
                 "Cidade API": api["municipio"],
                 "UF API": api["uf"],
                 "Abertura": api["abertura"],
+                "Fonte API": api.get("fonte", ""),
             })
             doc, match = search_mongo(api["nome_fantasia"], api["razao_social"])
         else:
