@@ -14,9 +14,9 @@ import os
 
 app = Flask(__name__)
 
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://henriquemanoel2002_db_user:3n4mECz3lLAMhFxq@nexus.xu9r1mz.mongodb.net/?appName=nexus")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyAbIdVjzwAUcZ7XcIfcXAj1M1GSrgMWH1k")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "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")
+MONGO_URI = os.environ["MONGO_URI"]
+GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
+CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
 
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
 coll = client["test"]["cnesestabelecimentos"]
@@ -221,8 +221,6 @@ def search_mongo(nome, razao):
             return doc, "parcial"
     return None, "não encontrado"
 
-GOOGLE_API_KEY = "AIzaSyAbIdVjzwAUcZ7XcIfcXAj1M1GSrgMWH1k"
-
 def google_text_search(query):
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
@@ -289,8 +287,6 @@ def google_nearby_transit(lat, lng):
     except Exception:
         pass
     return counts
-
-CLAUDE_API_KEY = "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"
 
 def get_photo_uris(photo_names, max_photos=3):
     uris = []
