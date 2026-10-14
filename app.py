@@ -327,45 +327,57 @@ def google_nearby_transit(lat, lng):
         pass
     return counts
 
-def get_photo_uris(photo_names, max_photos=3):
-    uris = []
+import base64
+
+def get_photo_base64(photo_names, max_photos=3):
+    images = []
     for name in photo_names[:max_photos]:
         if not name:
             continue
         media_name = name + "/media"
         url = f"https://places.googleapis.com/v1/{media_name}?maxWidthPx=800&key={GOOGLE_API_KEY}"
         try:
-            r = requests.get(url, timeout=10, allow_redirects=True)
-            if r.status_code == 200 and "photoUri" in r.text:
-                # response may be JSON or redirect
-                try:
-                    data = r.json()
-                    if data.get("photoUri"):
-                        uris.append(data["photoUri"])
-                except Exception:
-                    pass
-            elif r.status_code in (301, 302) and "Location" in r.headers:
-                uris.append(r.headers["Location"])
+            r = requests.get(url, timeout=15, allow_redirects=True)
+            if r.status_code == 200 and r.content and len(r.content) > 1000:
+                # Detecta tipo
+                content_type = r.headers.get("Content-Type", "image/jpeg")
+                if "jpeg" in content_type or "jpg" in content_type:
+                    media_type = "image/jpeg"
+                elif "png" in content_type:
+                    media_type = "image/png"
+                elif "webp" in content_type:
+                    media_type = "image/webp"
+                else:
+                    media_type = "image/jpeg"
+                b64 = base64.standard_b64encode(r.content).decode("utf-8")
+                images.append({"media_type": media_type, "data": b64})
         except Exception:
             pass
-        time.sleep(0.15)
-    return uris
+        time.sleep(0.2)
+    return images
 
-def claude_analyze(reviews_text, photo_uris):
-    if not reviews_text and not photo_uris:
-        return {"claude_pontos_fortes": "", "claude_pontos_fracos": "", "claude_analise_fotos": ""}
+def claude_analyze(reviews_text, photo_images):
+    if not reviews_text and not photo_images:
+        return {"claude_analise_completa": "", "claude_status": "sem dados"}
     
     content = []
-    # Imagens (até 3)
-    for uri in photo_uris[:3]:
+    for img in photo_images[:3]:
         content.append({
             "type": "image",
-            "source": {"type": "url", "url": uri}
+            "source": {
+                "type": "base64",
+                "media_type": img["media_type"],
+                "data": img["data"]
+            }
         })
     
     prompt = "Analise os comentários do Google e as fotos deste estabelecimento de saúde/odontologia.\n\n"
     if reviews_text:
         prompt += f"Comentários:\n{reviews_text}\n\n"
+    if photo_images:
+        prompt += f"Foram enviadas {len(photo_images)} foto(s) do local.\n\n"
+    else:
+        prompt += "Não foram enviadas fotos.\n\n"
     prompt += """Responda em português, de forma objetiva, neste formato:
 
 Pontos Fortes:
@@ -377,13 +389,13 @@ Pontos Fracos:
 - item 2
 
 Análise das Fotos:
-descrição breve do que as fotos mostram sobre o local (limpeza, estrutura, atendimento, etc.)."""
+descrição do que as fotos mostram (estrutura, limpeza, equipamentos, ambiente, etc.). Se não houver fotos, diga isso."""
     
     content.append({"type": "text", "text": prompt})
     
     payload = {
-        "model": "claude-sonnet-4-5-20250929",
-        "max_tokens": 800,
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 1000,
         "messages": [{"role": "user", "content": content}]
     }
     headers = {
@@ -392,17 +404,18 @@ descrição breve do que as fotos mostram sobre o local (limpeza, estrutura, ate
         "content-type": "application/json"
     }
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=60)
+        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=90)
         if r.status_code == 200:
             text = r.json()["content"][0]["text"]
             return {
                 "claude_analise_completa": text,
-                "claude_status": "ok"
+                "claude_status": "ok",
+                "fotos_enviadas": len(photo_images)
             }
         else:
-            return {"claude_status": f"erro {r.status_code}"}
+            return {"claude_status": f"erro {r.status_code}: {r.text[:120]}"}
     except Exception as e:
-        return {"claude_status": f"erro: {str(e)[:80]}"}
+        return {"claude_status": f"erro: {str(e)[:100]}"}
 
 def google_enrich(nome, endereco, cidade, uf):
     if not nome and not endereco:
@@ -456,8 +469,8 @@ def google_enrich(nome, endereco, cidade, uf):
     
     # Análise Claude (comentários + fotos)
     photo_names = [p.get("name") for p in photos if p.get("name")] if photos else []
-    photo_uris = get_photo_uris(photo_names, max_photos=3)
-    claude = claude_analyze(result.get("comentarios", ""), photo_uris)
+    photo_images = get_photo_base64(photo_names, max_photos=3)
+    claude = claude_analyze(result.get("comentarios", ""), photo_images)
     result.update(claude)
     
     return result
