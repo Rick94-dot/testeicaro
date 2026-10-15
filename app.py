@@ -358,7 +358,7 @@ def get_photo_base64(photo_names, max_photos=3):
 
 def claude_analyze(reviews_text, photo_images):
     if not reviews_text and not photo_images:
-        return {"claude_analise_completa": "", "claude_status": "sem dados"}
+        return {"claude_analise_completa": "", "claude_status": "sem dados", "scores_ia": {}}
     
     content = []
     for img in photo_images[:3]:
@@ -371,31 +371,31 @@ def claude_analyze(reviews_text, photo_images):
             }
         })
     
-    prompt = "Analise os comentários do Google e as fotos deste estabelecimento de saúde/odontologia.\n\n"
+    prompt = "Você é um avaliador de clínicas odontológicas. Analise os comentários e as fotos (se houver).\n\n"
     if reviews_text:
         prompt += f"Comentários:\n{reviews_text}\n\n"
     if photo_images:
-        prompt += f"Foram enviadas {len(photo_images)} foto(s) do local.\n\n"
+        prompt += f"Foram enviadas {len(photo_images)} foto(s).\n\n"
     else:
-        prompt += "Não foram enviadas fotos.\n\n"
-    prompt += """Responda em português, de forma objetiva, neste formato:
+        prompt += "Não há fotos.\n\n"
+    prompt += """Retorne APENAS um JSON válido com estas chaves (valores de 0 a 1, onde 1 = excelente/positivo, 0.5 = médio/neutro se não der para avaliar, 0 = ruim):
+{
+  "sala_espera": 0.0,
+  "estacionamento": 0.0,
+  "acesso_cadeirantes": 0.0,
+  "banheiro": 0.0,
+  "consultorio_limpo": 0.0,
+  "comentarios_positivos": 0.0,
+  "fotos_qualidade": 0.0
+}
 
-Pontos Fortes:
-- item 1
-- item 2
-
-Pontos Fracos:
-- item 1
-- item 2
-
-Análise das Fotos:
-descrição do que as fotos mostram (estrutura, limpeza, equipamentos, ambiente, etc.). Se não houver fotos, diga isso."""
+Depois do JSON, em uma linha separada, escreva uma breve análise em português."""
     
     content.append({"type": "text", "text": prompt})
     
     payload = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 1000,
+        "model": "claude-3-5-haiku-20241022",
+        "max_tokens": 600,
         "messages": [{"role": "user", "content": content}]
     }
     headers = {
@@ -404,18 +404,90 @@ descrição do que as fotos mostram (estrutura, limpeza, equipamentos, ambiente,
         "content-type": "application/json"
     }
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=90)
+        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=60)
         if r.status_code == 200:
             text = r.json()["content"][0]["text"]
+            scores_ia = {}
+            # tenta extrair JSON
+            import json
+            try:
+                start = text.find("{")
+                end = text.rfind("}") + 1
+                if start >= 0 and end > start:
+                    scores_ia = json.loads(text[start:end])
+            except Exception:
+                pass
             return {
                 "claude_analise_completa": text,
                 "claude_status": "ok",
-                "fotos_enviadas": len(photo_images)
+                "fotos_enviadas": len(photo_images),
+                "scores_ia": scores_ia
             }
         else:
-            return {"claude_status": f"erro {r.status_code}: {r.text[:120]}"}
+            return {"claude_status": f"erro {r.status_code}: {r.text[:100]}", "scores_ia": {}}
     except Exception as e:
-        return {"claude_status": f"erro: {str(e)[:100]}"}
+        return {"claude_status": f"erro: {str(e)[:80]}", "scores_ia": {}}
+
+def calculate_score(row):
+    """Calcula score 0-100 com base nos critérios ativos."""
+    scores = {}
+    total = 0
+    
+    # 14. CNES (10 pts)
+    has_cnes = bool(row.get("CNES"))
+    scores["CNES"] = 10 if has_cnes else 0
+    total += scores["CNES"]
+    
+    # 6. Nota do Google (15 pts) — proporcional
+    rating = row.get("google_rating")
+    if rating and isinstance(rating, (int, float)):
+        scores["Nota Google"] = round((rating / 5.0) * 15, 1)
+    else:
+        scores["Nota Google"] = 7.5  # média se não tiver
+    total += scores["Nota Google"]
+    
+    # 9. Acesso transporte público (13 pts)
+    metro = row.get("estacoes_metro_trem") or 0
+    onibus = row.get("pontos_onibus") or 0
+    transit_score = min(1.0, (metro * 0.6 + onibus * 0.2))
+    scores["Transporte"] = round(transit_score * 13, 1)
+    total += scores["Transporte"]
+    
+    # 12. Horário de atendimento (5 pts)
+    has_hours = bool(row.get("horarios"))
+    scores["Horário"] = 5 if has_hours else 2.5
+    total += scores["Horário"]
+    
+    # 13. Fotos da clínica (5 pts)
+    fotos = row.get("fotos_count") or 0
+    scores["Fotos"] = 5 if fotos >= 3 else (3 if fotos > 0 else 2.5)
+    total += scores["Fotos"]
+    
+    # Critérios avaliados pela IA (ou média se não houver)
+    ia = row.get("scores_ia") or {}
+    def ia_or_avg(key, max_pts):
+        val = ia.get(key)
+        if val is None:
+            return round(max_pts * 0.5, 1)  # média
+        try:
+            return round(float(val) * max_pts, 1)
+        except Exception:
+            return round(max_pts * 0.5, 1)
+    
+    scores["Sala espera"] = ia_or_avg("sala_espera", 8)
+    scores["Estacionamento"] = ia_or_avg("estacionamento", 8)
+    scores["Acesso cadeirantes"] = ia_or_avg("acesso_cadeirantes", 10)
+    scores["Banheiro"] = ia_or_avg("banheiro", 4)
+    scores["Consultório limpo"] = ia_or_avg("consultorio_limpo", 12)
+    
+    for k in ["Sala espera", "Estacionamento", "Acesso cadeirantes", "Banheiro", "Consultório limpo"]:
+        total += scores[k]
+    
+    # 1. Localização (10 pts) — IA avalia facilidade de acesso
+    scores["Localização"] = ia_or_avg("localizacao", 10)
+    total += scores["Localização"]
+    
+    return round(min(100, total), 1), scores
 
 def google_enrich(nome, endereco, cidade, uf):
     if not nome and not endereco:
@@ -467,10 +539,13 @@ def google_enrich(nome, endereco, cidade, uf):
         result["estacoes_metro_trem"] = None
         result["pontos_onibus"] = None
     
-    # Análise Claude (comentários + fotos)
+    # Análise Claude (comentários + fotos + localização)
     photo_names = [p.get("name") for p in photos if p.get("name")] if photos else []
     photo_images = get_photo_base64(photo_names, max_photos=3)
-    claude = claude_analyze(result.get("comentarios", ""), photo_images)
+    endereco_full = f"{endereco or ''} {cidade or ''} {uf or ''}".strip()
+    metro = result.get("estacoes_metro_trem") or 0
+    onibus = result.get("pontos_onibus") or 0
+    claude = claude_analyze(result.get("comentarios", ""), photo_images, endereco_full, metro, onibus)
     result.update(claude)
     
     return result
@@ -545,10 +620,15 @@ def process():
                 api.get("uf") if api else None
             )
             row.update(g)
-            time.sleep(0.3)  # rate limit Google
+            time.sleep(0.3)
         else:
             row["CNES"] = None
             row["Match"] = match
+        
+        # Calcula score
+        score, breakdown = calculate_score(row)
+        row["Score"] = score
+        row["Detalhe Score"] = str(breakdown)
         results.append(row)
 
     out = pd.DataFrame(results)
