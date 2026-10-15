@@ -412,7 +412,19 @@ Depois do JSON, em uma linha separada, escreva uma breve análise em português.
     try:
         r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=60)
         if r.status_code == 200:
-            text = r.json()["content"][0]["text"]
+            data = r.json()
+            text = ""
+            # Haiku 5.5 pode retornar vários blocos; pega o primeiro que tiver "text"
+            for block in data.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
+                    text = block["text"]
+                    break
+            if not text:
+                # fallback: tenta o formato antigo
+                try:
+                    text = data["content"][0]["text"]
+                except Exception:
+                    text = str(data)[:500]
             scores_ia = {}
             import json
             try:
@@ -429,9 +441,9 @@ Depois do JSON, em uma linha separada, escreva uma breve análise em português.
                 "scores_ia": scores_ia
             }
         else:
-            return {"claude_status": f"erro {r.status_code}: {r.text[:100]}", "scores_ia": {}}
+            return {"claude_status": f"erro {r.status_code}: {r.text[:150]}", "scores_ia": {}}
     except Exception as e:
-        return {"claude_status": f"erro: {str(e)[:80]}", "scores_ia": {}}
+        return {"claude_status": f"erro: {str(e)[:100]}", "scores_ia": {}}
 
 def calculate_score(row):
     """Calcula score 0-100 com base nos critérios ativos."""
