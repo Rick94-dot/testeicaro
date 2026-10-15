@@ -356,8 +356,8 @@ def get_photo_base64(photo_names, max_photos=3):
         time.sleep(0.2)
     return images
 
-def claude_analyze(reviews_text, photo_images):
-    if not reviews_text and not photo_images:
+def claude_analyze(reviews_text, photo_images, endereco="", metro=0, onibus=0):
+    if not reviews_text and not photo_images and not endereco:
         return {"claude_analise_completa": "", "claude_status": "sem dados", "scores_ia": {}}
     
     content = []
@@ -371,15 +371,20 @@ def claude_analyze(reviews_text, photo_images):
             }
         })
     
-    prompt = "Você é um avaliador de clínicas odontológicas. Analise os comentários e as fotos (se houver).\n\n"
+    prompt = "Você é um avaliador de clínicas odontológicas. Analise os dados abaixo.\n\n"
     if reviews_text:
         prompt += f"Comentários:\n{reviews_text}\n\n"
     if photo_images:
         prompt += f"Foram enviadas {len(photo_images)} foto(s).\n\n"
     else:
         prompt += "Não há fotos.\n\n"
-    prompt += """Retorne APENAS um JSON válido com estas chaves (valores de 0 a 1, onde 1 = excelente/positivo, 0.5 = médio/neutro se não der para avaliar, 0 = ruim):
+    if endereco:
+        prompt += f"Endereço da clínica: {endereco}\n"
+        prompt += f"Estações de metrô/trem próximas (até 1 km): {metro}\n"
+        prompt += f"Pontos de ônibus próximos (até 500 m): {onibus}\n\n"
+    prompt += """Retorne APENAS um JSON válido com estas chaves (valores de 0 a 1, onde 1 = excelente, 0.5 = médio se não der para avaliar, 0 = ruim):
 {
+  "localizacao": 0.0,
   "sala_espera": 0.0,
   "estacionamento": 0.0,
   "acesso_cadeirantes": 0.0,
@@ -389,13 +394,14 @@ def claude_analyze(reviews_text, photo_images):
   "fotos_qualidade": 0.0
 }
 
+Para "localizacao", considere se o endereço parece de fácil acesso e a quantidade de transporte público próximo.
 Depois do JSON, em uma linha separada, escreva uma breve análise em português."""
     
     content.append({"type": "text", "text": prompt})
     
     payload = {
         "model": "claude-3-5-haiku-20241022",
-        "max_tokens": 600,
+        "max_tokens": 700,
         "messages": [{"role": "user", "content": content}]
     }
     headers = {
@@ -408,7 +414,6 @@ Depois do JSON, em uma linha separada, escreva uma breve análise em português.
         if r.status_code == 200:
             text = r.json()["content"][0]["text"]
             scores_ia = {}
-            # tenta extrair JSON
             import json
             try:
                 start = text.find("{")
