@@ -11,6 +11,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 import os
+import threading
+import uuid
+import json
 
 app = Flask(__name__)
 
@@ -20,6 +23,10 @@ CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
 
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
 coll = client["test"]["cnesestabelecimentos"]
+
+# Jobs em memória (para processamento em segundo plano)
+jobs = {}
+jobs_lock = threading.Lock()
 
 HTML = """
 <!DOCTYPE html>
@@ -88,6 +95,16 @@ HTML = """
     font-size: 0.9rem;
     min-height: 1.4rem;
   }
+  .beta {
+    position: fixed;
+    bottom: 1rem;
+    left: 0;
+    right: 0;
+    text-align: center;
+    color: #444;
+    font-size: 0.75rem;
+    letter-spacing: 0.3px;
+  }
   .hidden { display: none; }
 </style>
 </head>
@@ -131,23 +148,49 @@ function setFile(f) {
 btn.onclick = async () => {
   if (!selectedFile) return;
   btn.disabled = true;
-  status.textContent = 'Processando (API + Mongo + Google + Claude)... isso pode levar vários minutos.';
+  status.textContent = 'Processando';
   const fd = new FormData();
   fd.append('file', selectedFile);
   try {
     const res = await fetch('/process', { method: 'POST', body: fd });
     if (!res.ok) throw new Error(await res.text());
-    const blob = await res.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'prestadores_enriquecidos.xlsx';
-    a.click();
-    status.textContent = 'Arquivo gerado e baixado.';
+    const data = await res.json();
+    const jobId = data.job_id;
+    pollStatus(jobId);
   } catch (e) {
     status.textContent = 'Erro: ' + e.message;
+    btn.disabled = false;
   }
-  btn.disabled = false;
 };
+
+async function pollStatus(jobId) {
+  const interval = setInterval(async () => {
+    try {
+      const r = await fetch('/status/' + jobId);
+      const j = await r.json();
+      if (j.status === 'done') {
+        clearInterval(interval);
+        status.textContent = 'Pronto. Baixando...';
+        const a = document.createElement('a');
+        a.href = '/download/' + jobId;
+        a.download = 'prestadores_enriquecidos.xlsx';
+        a.click();
+        status.textContent = 'Arquivo gerado e baixado.';
+        btn.disabled = false;
+      } else if (j.status === 'error') {
+        clearInterval(interval);
+        status.textContent = 'Erro: ' + (j.error || 'falha no processamento');
+        btn.disabled = false;
+      } else {
+        status.textContent = 'Processando' + (j.progress ? ' (' + j.progress + ')' : '');
+      }
+    } catch (e) {
+      clearInterval(interval);
+      status.textContent = 'Erro ao consultar status';
+      btn.disabled = false;
+    }
+  }, 3000);
+}
 </script>
 </body>
 </html>
@@ -332,7 +375,7 @@ def google_nearby_transit(lat, lng):
 
 import base64
 
-def get_photo_base64(photo_names, max_photos=3):
+def get_photo_base64(photo_names, max_photos=1):
     images = []
     for name in photo_names[:max_photos]:
         if not name:
@@ -561,7 +604,7 @@ def google_enrich(nome, endereco, cidade, uf):
     
     # Análise Claude (comentários + fotos + localização)
     photo_names = [p.get("name") for p in photos if p.get("name")] if photos else []
-    photo_images = get_photo_base64(photo_names, max_photos=3)
+    photo_images = get_photo_base64(photo_names, max_photos=1)
     endereco_full = f"{endereco or ''} {cidade or ''} {uf or ''}".strip()
     metro = result.get("estacoes_metro_trem") or 0
     onibus = result.get("pontos_onibus") or 0
@@ -576,12 +619,6 @@ def index():
 
 @app.route("/process", methods=["POST"])
 def process():
-    try:
-        return _process()
-    except Exception as e:
-        return f"Erro interno: {str(e)[:200]}", 500
-
-def _process():
     if "file" not in request.files:
         return "Nenhum arquivo", 400
     f = request.files["file"]
@@ -590,84 +627,118 @@ def _process():
     except Exception as e:
         return f"Erro ao ler Excel: {e}", 400
 
-    # acha coluna CNPJ
-    cnpj_col = None
-    for col in df.columns:
-        if re.search(r"cnpj", str(col), re.I):
-            cnpj_col = col
-            break
-    if cnpj_col is None:
-        # tenta primeira coluna com muitos CNPJs
-        for col in df.columns:
-            sample = df[col].head(30).apply(clean_cnpj).notna().sum()
-            if sample >= 5:
-                cnpj_col = col
-                break
-    if cnpj_col is None:
-        return "Não encontrei coluna de CNPJ", 400
+    job_id = str(uuid.uuid4())[:8]
+    with jobs_lock:
+        jobs[job_id] = {"status": "processing", "progress": "0%", "result": None, "error": None}
 
-    results = []
-    cnpjs = df[cnpj_col].apply(clean_cnpj).dropna().unique()
-
-    for i, cnpj in enumerate(cnpjs):
+    def run_job():
         try:
-            api = fetch_cnpj(cnpj)
-            time.sleep(0.35)
-            row = {"CNPJ": cnpj}
-            if api:
-                row.update({
-                    "Razão Social (API)": api["razao_social"],
-                    "Nome Fantasia (API)": api["nome_fantasia"],
-                    "Situação": api["situacao"],
-                    "CNAE": api["cnae"],
-                    "Cidade API": api["municipio"],
-                    "UF API": api["uf"],
-                    "Abertura": api["abertura"],
-                    "Fonte API": api.get("fonte", ""),
-                })
-                doc, match = search_mongo(api["nome_fantasia"], api["razao_social"])
-            else:
-                row["Erro API"] = "Não encontrado"
-                doc, match = None, "sem API"
-            if doc:
-                row.update({
-                    "CNES": doc.get("cnes"),
-                    "Nome Fantasia (CNES)": doc.get("nomeFantasia"),
-                    "Razão Social (CNES)": doc.get("razaoSocial"),
-                    "Endereço": doc.get("endereco"),
-                    "CEP": doc.get("cep"),
-                    "Telefone": doc.get("telefone"),
-                    "Match": match,
-                })
-                g = google_enrich(
-                    doc.get("nomeFantasia") or (api.get("nome_fantasia") if api else None),
-                    doc.get("endereco"),
-                    api.get("municipio") if api else None,
-                    api.get("uf") if api else None
-                )
-                row.update(g)
-                time.sleep(0.3)
-            else:
-                row["CNES"] = None
-                row["Match"] = match
-            
-            score, breakdown = calculate_score(row)
-            row["Score"] = score
-            row["Detalhe Score"] = str(breakdown)
-            # converte dicts aninhados para string (Excel não aceita)
-            if isinstance(row.get("scores_ia"), dict):
-                row["scores_ia"] = str(row["scores_ia"])
-            results.append(row)
-        except Exception as e:
-            results.append({"CNPJ": cnpj, "Erro": str(e)[:150]})
+            cnpj_col = None
+            for col in df.columns:
+                if re.search(r"cnpj", str(col), re.I):
+                    cnpj_col = col
+                    break
+            if cnpj_col is None:
+                for col in df.columns:
+                    sample = df[col].head(30).apply(clean_cnpj).notna().sum()
+                    if sample >= 5:
+                        cnpj_col = col
+                        break
+            if cnpj_col is None:
+                raise Exception("Não encontrei coluna de CNPJ")
 
-    out = pd.DataFrame(results)
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        out.to_excel(writer, index=False, sheet_name="Resultados")
-    buffer.seek(0)
+            results = []
+            cnpjs = list(df[cnpj_col].apply(clean_cnpj).dropna().unique())
+            total = len(cnpjs)
+
+            for i, cnpj in enumerate(cnpjs):
+                try:
+                    api = fetch_cnpj(cnpj)
+                    time.sleep(0.3)
+                    row = {"CNPJ": cnpj}
+                    if api:
+                        row.update({
+                            "Razão Social (API)": api["razao_social"],
+                            "Nome Fantasia (API)": api["nome_fantasia"],
+                            "Situação": api["situacao"],
+                            "CNAE": api["cnae"],
+                            "Cidade API": api["municipio"],
+                            "UF API": api["uf"],
+                            "Abertura": api["abertura"],
+                            "Fonte API": api.get("fonte", ""),
+                        })
+                        doc, match = search_mongo(api["nome_fantasia"], api["razao_social"])
+                    else:
+                        row["Erro API"] = "Não encontrado"
+                        doc, match = None, "sem API"
+                    if doc:
+                        row.update({
+                            "CNES": doc.get("cnes"),
+                            "Nome Fantasia (CNES)": doc.get("nomeFantasia"),
+                            "Razão Social (CNES)": doc.get("razaoSocial"),
+                            "Endereço": doc.get("endereco"),
+                            "CEP": doc.get("cep"),
+                            "Telefone": doc.get("telefone"),
+                            "Match": match,
+                        })
+                        g = google_enrich(
+                            doc.get("nomeFantasia") or (api.get("nome_fantasia") if api else None),
+                            doc.get("endereco"),
+                            api.get("municipio") if api else None,
+                            api.get("uf") if api else None
+                        )
+                        row.update(g)
+                        time.sleep(0.2)
+                    else:
+                        row["CNES"] = None
+                        row["Match"] = match
+                    
+                    score, breakdown = calculate_score(row)
+                    row["Score"] = score
+                    row["Detalhe Score"] = str(breakdown)
+                    if isinstance(row.get("scores_ia"), dict):
+                        row["scores_ia"] = str(row["scores_ia"])
+                    results.append(row)
+                except Exception as e:
+                    results.append({"CNPJ": cnpj, "Erro": str(e)[:150]})
+                
+                with jobs_lock:
+                    jobs[job_id]["progress"] = f"{i+1}/{total}"
+
+            out = pd.DataFrame(results)
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                out.to_excel(writer, index=False, sheet_name="Resultados")
+            buffer.seek(0)
+            with jobs_lock:
+                jobs[job_id]["status"] = "done"
+                jobs[job_id]["result"] = buffer.getvalue()
+                jobs[job_id]["progress"] = f"{total}/{total}"
+        except Exception as e:
+            with jobs_lock:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"] = str(e)[:200]
+
+    t = threading.Thread(target=run_job, daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/status/<job_id>")
+def status(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"status": "error", "error": "job não encontrado"}), 404
+    return jsonify({"status": job["status"], "progress": job.get("progress"), "error": job.get("error")})
+
+@app.route("/download/<job_id>")
+def download(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job or job["status"] != "done" or not job.get("result"):
+        return "Ainda não pronto ou job inválido", 404
     return send_file(
-        buffer,
+        io.BytesIO(job["result"]),
         as_attachment=True,
         download_name=f"prestadores_enriquecidos_{datetime.now().strftime('%Y%m%d')}.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
