@@ -102,6 +102,7 @@ HTML = """
   <button id="btn" disabled>Processar</button>
   <div id="status"></div>
 </div>
+<div class="beta">essa é uma versão beta do ÍCARO</div>
 
 <script>
 const zone = document.getElementById('zone');
@@ -168,6 +169,8 @@ def clean_cnpj(val):
     if pd.isna(val):
         return None
     s = re.sub(r"\D", "", str(val))
+    if len(s) == 13:
+        s = "0" + s  # Excel às vezes remove o zero à esquerda
     return s if len(s) == 14 else None
 
 def fetch_cnpj(cnpj):
@@ -573,6 +576,12 @@ def index():
 
 @app.route("/process", methods=["POST"])
 def process():
+    try:
+        return _process()
+    except Exception as e:
+        return f"Erro interno: {str(e)[:200]}", 500
+
+def _process():
     if "file" not in request.files:
         return "Nenhum arquivo", 400
     f = request.files["file"]
@@ -601,52 +610,56 @@ def process():
     cnpjs = df[cnpj_col].apply(clean_cnpj).dropna().unique()
 
     for i, cnpj in enumerate(cnpjs):
-        api = fetch_cnpj(cnpj)
-        time.sleep(0.35)  # respeita rate limit
-        row = {"CNPJ": cnpj}
-        if api:
-            row.update({
-                "Razão Social (API)": api["razao_social"],
-                "Nome Fantasia (API)": api["nome_fantasia"],
-                "Situação": api["situacao"],
-                "CNAE": api["cnae"],
-                "Cidade API": api["municipio"],
-                "UF API": api["uf"],
-                "Abertura": api["abertura"],
-                "Fonte API": api.get("fonte", ""),
-            })
-            doc, match = search_mongo(api["nome_fantasia"], api["razao_social"])
-        else:
-            row["Erro API"] = "Não encontrado"
-            doc, match = None, "sem API"
-        if doc:
-            row.update({
-                "CNES": doc.get("cnes"),
-                "Nome Fantasia (CNES)": doc.get("nomeFantasia"),
-                "Razão Social (CNES)": doc.get("razaoSocial"),
-                "Endereço": doc.get("endereco"),
-                "CEP": doc.get("cep"),
-                "Telefone": doc.get("telefone"),
-                "Match": match,
-            })
-            # Google Places enrichment
-            g = google_enrich(
-                doc.get("nomeFantasia") or api.get("nome_fantasia") if api else None,
-                doc.get("endereco"),
-                api.get("municipio") if api else None,
-                api.get("uf") if api else None
-            )
-            row.update(g)
-            time.sleep(0.3)
-        else:
-            row["CNES"] = None
-            row["Match"] = match
-        
-        # Calcula score
-        score, breakdown = calculate_score(row)
-        row["Score"] = score
-        row["Detalhe Score"] = str(breakdown)
-        results.append(row)
+        try:
+            api = fetch_cnpj(cnpj)
+            time.sleep(0.35)
+            row = {"CNPJ": cnpj}
+            if api:
+                row.update({
+                    "Razão Social (API)": api["razao_social"],
+                    "Nome Fantasia (API)": api["nome_fantasia"],
+                    "Situação": api["situacao"],
+                    "CNAE": api["cnae"],
+                    "Cidade API": api["municipio"],
+                    "UF API": api["uf"],
+                    "Abertura": api["abertura"],
+                    "Fonte API": api.get("fonte", ""),
+                })
+                doc, match = search_mongo(api["nome_fantasia"], api["razao_social"])
+            else:
+                row["Erro API"] = "Não encontrado"
+                doc, match = None, "sem API"
+            if doc:
+                row.update({
+                    "CNES": doc.get("cnes"),
+                    "Nome Fantasia (CNES)": doc.get("nomeFantasia"),
+                    "Razão Social (CNES)": doc.get("razaoSocial"),
+                    "Endereço": doc.get("endereco"),
+                    "CEP": doc.get("cep"),
+                    "Telefone": doc.get("telefone"),
+                    "Match": match,
+                })
+                g = google_enrich(
+                    doc.get("nomeFantasia") or (api.get("nome_fantasia") if api else None),
+                    doc.get("endereco"),
+                    api.get("municipio") if api else None,
+                    api.get("uf") if api else None
+                )
+                row.update(g)
+                time.sleep(0.3)
+            else:
+                row["CNES"] = None
+                row["Match"] = match
+            
+            score, breakdown = calculate_score(row)
+            row["Score"] = score
+            row["Detalhe Score"] = str(breakdown)
+            # converte dicts aninhados para string (Excel não aceita)
+            if isinstance(row.get("scores_ia"), dict):
+                row["scores_ia"] = str(row["scores_ia"])
+            results.append(row)
+        except Exception as e:
+            results.append({"CNPJ": cnpj, "Erro": str(e)[:150]})
 
     out = pd.DataFrame(results)
     buffer = io.BytesIO()
