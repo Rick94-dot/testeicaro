@@ -400,7 +400,7 @@ Depois do JSON, em uma linha separada, escreva uma breve análise em português.
     content.append({"type": "text", "text": prompt})
     
     payload = {
-        "model": "claude-3-5-haiku-20241022",
+        "model": "claude-haiku-5-5",
         "max_tokens": 700,
         "messages": [{"role": "user", "content": content}]
     }
